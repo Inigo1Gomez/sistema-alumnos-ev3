@@ -1,7 +1,11 @@
 // Jenkinsfile - Pipeline de "Sistema Alumnos" (SecureDev · Evaluación Parcial 3 · OCY1102)
 //
-// Esta es la versión BASE: construye, prueba y despliega en producción.
-// Los marcadores  >>> [ETIQUETA]  indican dónde agregar las etapas de seguridad.
+// Pipeline DevSecOps:
+//   Build -> Test -> Security Review (SAST: Bandit) -> Dependency Management (SCA: pip-audit)
+//   -> Deploy Staging -> DAST - OWASP ZAP -> Deploy Producción (solo si TODO lo anterior quedó en verde)
+//
+// Las herramientas de seguridad marcan el build como UNSTABLE (amarillo) cuando encuentran hallazgos;
+// el "gate" de producción impide desplegar un build UNSTABLE o FAILED.
 pipeline {
     agent any
 
@@ -49,12 +53,64 @@ pipeline {
             }
         }
 
-        // >>> [SEGURIDAD]: aquí van las etapas "Security Review (SAST)" y "Dependency Management"
+        // [SEGURIDAD] Revisión del código (SAST) con Bandit
+        stage('Security Review (SAST)') {
+            steps {
+                // Reportes completos (todas las severidades) para el registro y la trazabilidad
+                sh 'bandit -f json -o reports/bandit.json app.py || true'
+                sh 'bandit -f txt -o reports/bandit.txt app.py || true'
+                sh 'cat reports/bandit.txt'
+                // Control de calidad: hallazgos Medium o High dejan el build UNSTABLE
+                catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE',
+                           message: 'Bandit encontró hallazgos de severidad Medium/High') {
+                    sh 'bandit -q -ll app.py'
+                }
+            }
+        }
 
-        // >>> [ZAP]: aquí van las etapas "Deploy Staging" y "DAST - OWASP ZAP"
+        // [SEGURIDAD] Dependencias con vulnerabilidades conocidas (SCA) con pip-audit
+        stage('Dependency Management') {
+            steps {
+                sh 'pip-audit -r requirements.txt -f json -o reports/pip-audit.json || true'
+                catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE',
+                           message: 'pip-audit encontró dependencias con CVE') {
+                    sh '''
+                        estado=0
+                        pip-audit -r requirements.txt > reports/pip-audit.txt 2>&1 || estado=$?
+                        cat reports/pip-audit.txt
+                        exit $estado
+                    '''
+                }
+            }
+        }
+
+        // [ZAP] Despliegue en staging para el análisis dinámico
+        stage('Deploy Staging') {
+            steps {
+                sh 'bash scripts/deploy.sh staging 5001'
+            }
+        }
+
+        // [ZAP] Pruebas automatizadas de seguridad (DAST) con OWASP ZAP sobre staging
+        stage('DAST - OWASP ZAP') {
+            steps {
+                script {
+                    def estado = sh(returnStatus: true, script: 'python3 scripts/zap_scan.py http://jenkins:5001')
+                    if (estado == 2) {
+                        unstable('OWASP ZAP encontró alertas de riesgo High/Medium (ver reports/zap-report.html)')
+                    } else if (estado != 0) {
+                        error("El escaneo de OWASP ZAP falló (código ${estado})")
+                    }
+                }
+            }
+        }
 
         stage('Deploy Producción') {
-            // >>> [GATE]: aquí va la condición "when" que protege producción
+            // [GATE] Producción solo recibe builds sin hallazgos: pruebas, SAST, SCA y DAST en verde
+            when {
+                beforeAgent true
+                expression { currentBuild.currentResult == 'SUCCESS' }
+            }
             steps {
                 sh 'bash scripts/deploy.sh produccion 5000'
                 script { env.PRODUCCION = env.APP_VERSION }
@@ -69,6 +125,9 @@ pipeline {
                 sh 'python3 scripts/trazabilidad.py'
             }
             archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
+        }
+        unstable {
+            echo 'Build UNSTABLE: hay hallazgos de seguridad. Producción NO se actualizó (gate).'
         }
     }
 }
