@@ -25,6 +25,12 @@ app = Flask(__name__)
 ## una aleatoria por proceso. La clave del admin se guarda como hash lento con sal (scrypt/PBKDF2),
 ## generado con werkzeug.security.generate_password_hash; sin ADMIN_CLAVE_HASH el login queda deshabilitado.
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+# VULN-07: cookie de sesión no accesible desde JavaScript y no enviada desde otros sitios.
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Strict",
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "0") == "1",  # activar detrás de HTTPS
+)
 ADMIN_USUARIO = os.environ.get("ADMIN_USUARIO", "admin")
 ADMIN_CLAVE_HASH = os.environ.get("ADMIN_CLAVE_HASH", "")
 if not ADMIN_CLAVE_HASH:
@@ -74,6 +80,20 @@ def _para_log(texto):
     @brief Neutraliza saltos de línea y recorta un valor del usuario antes de escribirlo en el log (CWE-117).
     """
     return texto.replace("\r", "\\r").replace("\n", "\\n")[:50]
+
+
+## VULN-07: cabeceras de seguridad en todas las respuestas (CWE-693, CWE-1021).
+CABECERAS_SEGURIDAD = {
+    "Content-Security-Policy": "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "geolocation=(), camera=(), microphone=()",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Cross-Origin-Embedder-Policy": "require-corp",
+    "Cache-Control": "no-store",
+}
 
 
 ## Patrones que delatan un intento de ataque (detección, no bloqueo).
@@ -162,6 +182,8 @@ def despues_de_la_peticion(respuesta):
     @param respuesta Respuesta que Flask enviará al cliente.
     @return La misma respuesta.
     """
+    for cabecera, valor in CABECERAS_SEGURIDAD.items():
+        respuesta.headers.setdefault(cabecera, valor)
     endpoint = request.url_rule.rule if request.url_rule else "desconocido"
     if endpoint != "/metrics":
         HTTP_PETICIONES.labels(request.method, endpoint, str(respuesta.status_code)).inc()
