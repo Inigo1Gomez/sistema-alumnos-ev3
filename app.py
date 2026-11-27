@@ -9,7 +9,9 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
 import time
+from collections import defaultdict, deque
 
 from flask import Flask, Response, g, jsonify, render_template_string, request
 from markupsafe import escape
@@ -45,9 +47,34 @@ HTTP_PETICIONES = Counter("http_requests_total", "Peticiones HTTP atendidas", ["
 HTTP_LATENCIA = Histogram("http_request_duration_seconds", "Duración de las peticiones HTTP", ["endpoint"])
 LOGIN_FALLIDOS = Counter("login_fallidos_total", "Intentos de inicio de sesión fallidos")
 LOGIN_EXITOSOS = Counter("login_exitosos_total", "Inicios de sesión correctos")
+LOGIN_BLOQUEADOS = Counter("login_bloqueados_total", "Intentos de login rechazados por exceso de intentos (HTTP 429)")
 SOSPECHOSAS = Counter("peticiones_sospechosas_total", "Peticiones con patrones de ataque", ["tipo"])
 APP_INFO = Gauge("app_info", "Versión desplegada de la aplicación", ["version"])
 APP_INFO.labels(version=VERSION).set(1)
+
+## VULN-05: límite de intentos fallidos de login por IP (contra fuerza bruta, CWE-307).
+LOGIN_MAX_FALLOS = int(os.environ.get("LOGIN_MAX_FALLOS", "5"))
+LOGIN_VENTANA_S = int(os.environ.get("LOGIN_VENTANA_S", "300"))
+_fallos_por_ip = defaultdict(deque)
+_fallos_lock = threading.Lock()
+
+
+def _fallos_recientes(ip, ahora):
+    """!
+    @brief Descarta los fallos fuera de la ventana y devuelve la cola de fallos vigentes de la IP.
+    """
+    cola = _fallos_por_ip[ip]
+    while cola and ahora - cola[0] > LOGIN_VENTANA_S:
+        cola.popleft()
+    return cola
+
+
+def _para_log(texto):
+    """!
+    @brief Neutraliza saltos de línea y recorta un valor del usuario antes de escribirlo en el log (CWE-117).
+    """
+    return texto.replace("\r", "\\r").replace("\n", "\\n")[:50]
+
 
 ## Patrones que delatan un intento de ataque (detección, no bloqueo).
 PATRONES_ATAQUE = {
@@ -229,15 +256,30 @@ def login():
     @brief Valida las credenciales del administrador enviadas por formulario.
     @return JSON con el resultado; 401 si las credenciales no son válidas.
     """
+    ip = request.remote_addr or "desconocida"
+    with _fallos_lock:
+        bloqueada = len(_fallos_recientes(ip, time.monotonic())) >= LOGIN_MAX_FALLOS
+    if bloqueada:
+        LOGIN_FALLIDOS.inc()
+        LOGIN_BLOQUEADOS.inc()
+        app.logger.warning("Login bloqueado por exceso de intentos desde %s", ip)
+        respuesta = jsonify({"error": "Demasiados intentos. Intenta más tarde."})
+        respuesta.headers["Retry-After"] = str(LOGIN_VENTANA_S)
+        return respuesta, 429
+
     usuario = request.form.get("usuario", "")
     clave = request.form.get("clave", "")
     usuario_ok = secrets.compare_digest(usuario.encode(), ADMIN_USUARIO.encode())
     clave_ok = bool(ADMIN_CLAVE_HASH) and check_password_hash(ADMIN_CLAVE_HASH, clave)
     if usuario_ok and clave_ok:
+        with _fallos_lock:
+            _fallos_por_ip.pop(ip, None)
         LOGIN_EXITOSOS.inc()
         return jsonify({"mensaje": "Bienvenido, administrador"})
+    with _fallos_lock:
+        _fallos_recientes(ip, time.monotonic()).append(time.monotonic())
     LOGIN_FALLIDOS.inc()
-    app.logger.warning("Login fallido para el usuario '%s' desde %s", usuario, request.remote_addr)
+    app.logger.warning("Login fallido para el usuario '%s' desde %s", _para_log(usuario), ip)
     return jsonify({"error": "Credenciales inválidas"}), 401
 
 
