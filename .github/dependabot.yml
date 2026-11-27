@@ -1,0 +1,31 @@
+# Dependabot: gestión automática de dependencias de "Sistema Alumnos".
+# - Revisa requirements.txt y requirements-dev.txt (ecosistema pip) todos los días.
+# - Agrupa las actualizaciones en UN solo PR: Flask, Werkzeug y Jinja2 dependen entre sí
+#   y actualizarlos por separado rompería la instalación.
+# - Cada PR fusionado en main dispara el pipeline de Jenkins (pollSCM), que vuelve a correr
+#   pruebas, Bandit, pip-audit y OWASP ZAP antes de permitir el despliegue en producción.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "daily"
+      time: "08:00"
+      timezone: "America/Santiago"
+    open-pull-requests-limit: 5
+    target-branch: "main"
+    labels:
+      - "dependencies"
+      - "security"
+    commit-message:
+      prefix: "DEP"
+      include: "scope"
+    groups:
+      dependencias-python:
+        applies-to: version-updates
+        patterns:
+          - "*"
+      seguridad-python:
+        applies-to: security-updates
+        patterns:
+          - "*"
