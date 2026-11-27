@@ -13,7 +13,7 @@ import threading
 import time
 from collections import defaultdict, deque
 
-from flask import Flask, Response, g, jsonify, render_template_string, request
+from flask import Flask, Response, g, jsonify, render_template_string, request, session
 from markupsafe import escape
 from werkzeug.security import check_password_hash
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
@@ -100,6 +100,7 @@ PORTADA = """<!doctype html>
 </form>
 <h2>Acceso administrador</h2>
 <form action="/login" method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
   <input name="usuario" value="admin"> <input name="clave" type="password" value="">
   <button type="submit">Entrar</button>
 </form>
@@ -174,7 +175,10 @@ def portada():
     @brief Portada HTML con enlaces y formularios del sistema.
     @return Página HTML.
     """
-    return render_template_string(PORTADA, version=VERSION)
+    # VULN-06: token anti-CSRF por sesión, enviado como campo oculto del formulario de login.
+    if "csrf_token" not in session:
+        session["csrf_token"] = secrets.token_urlsafe(32)
+    return render_template_string(PORTADA, version=VERSION, csrf_token=session["csrf_token"])
 
 
 @app.route("/hello")
@@ -256,6 +260,12 @@ def login():
     @brief Valida las credenciales del administrador enviadas por formulario.
     @return JSON con el resultado; 401 si las credenciales no son válidas.
     """
+    # VULN-06: rechaza peticiones sin el token anti-CSRF de la sesión (CWE-352).
+    token_sesion = session.get("csrf_token", "")
+    token_form = request.form.get("csrf_token", "")
+    if not token_sesion or not secrets.compare_digest(token_sesion, token_form):
+        return jsonify({"error": "Token anti-CSRF inválido o ausente"}), 400
+
     ip = request.remote_addr or "desconocida"
     with _fallos_lock:
         bloqueada = len(_fallos_recientes(ip, time.monotonic())) >= LOGIN_MAX_FALLOS
